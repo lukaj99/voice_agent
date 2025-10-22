@@ -17,13 +17,141 @@ export function VoiceAgent() {
   );
   const [error, setError] = useState<string | null>(null);
   const [transcripts, setTranscripts] = useState<string[]>([]);
+  const [inputLevel, setInputLevel] = useState(0);
+  const [roundTripMs, setRoundTripMs] = useState<number | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const responseBufferRef = useRef<TranscriptMap>({});
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const analyserDataRef = useRef<Float32Array | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const levelRafRef = useRef<number | null>(null);
+  const statsIntervalRef = useRef<number | null>(null);
 
   const isActive = status === "connected";
+
+  const stopLevelMonitor = useCallback(() => {
+    if (levelRafRef.current !== null) {
+      cancelAnimationFrame(levelRafRef.current);
+      levelRafRef.current = null;
+    }
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.disconnect();
+      sourceNodeRef.current = null;
+    }
+    if (analyserRef.current) {
+      analyserRef.current.disconnect();
+      analyserRef.current = null;
+    }
+    analyserDataRef.current = null;
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => undefined);
+      audioContextRef.current = null;
+    }
+    setInputLevel(0);
+  }, []);
+
+  const stopStatsMonitor = useCallback(() => {
+    if (statsIntervalRef.current !== null) {
+      clearInterval(statsIntervalRef.current);
+      statsIntervalRef.current = null;
+    }
+    setRoundTripMs(null);
+  }, []);
+
+  const startLevelMonitor = useCallback(
+    async (stream: MediaStream) => {
+      try {
+        stopLevelMonitor();
+
+        if (!audioContextRef.current) {
+          audioContextRef.current = new AudioContext();
+        }
+
+        if (audioContextRef.current.state === "suspended") {
+          await audioContextRef.current.resume();
+        }
+
+        const source =
+          sourceNodeRef.current ??
+          audioContextRef.current.createMediaStreamSource(stream);
+        const analyser =
+          analyserRef.current ?? audioContextRef.current.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+
+        const data =
+          analyserDataRef.current ??
+          new Float32Array(analyser.fftSize);
+
+        sourceNodeRef.current = source;
+        analyserRef.current = analyser;
+        analyserDataRef.current = data;
+
+        const updateLevel = () => {
+          if (!analyserRef.current || !analyserDataRef.current) {
+            return;
+          }
+
+          const array = analyserDataRef.current;
+          if (!array) {
+            return;
+          }
+
+          analyserRef.current.getFloatTimeDomainData(
+            array as unknown as Float32Array<ArrayBuffer>,
+          );
+          let sumSquares = 0;
+          for (const sample of array) {
+            sumSquares += sample * sample;
+          }
+          const rms = Math.sqrt(sumSquares / array.length);
+          setInputLevel((prev) => prev * 0.7 + rms * 0.3);
+          levelRafRef.current = requestAnimationFrame(updateLevel);
+        };
+
+        updateLevel();
+      } catch (err) {
+        console.warn("Unable to start level monitor", err);
+      }
+    },
+    [stopLevelMonitor],
+  );
+
+  const startStatsMonitor = useCallback(
+    (connection: RTCPeerConnection) => {
+      stopStatsMonitor();
+      const intervalId = window.setInterval(async () => {
+        try {
+          const stats = await connection.getStats();
+          let bestRtt: number | null = null;
+          stats.forEach((report) => {
+            if (
+              report.type === "candidate-pair" &&
+              report.state === "succeeded" &&
+              typeof report.currentRoundTripTime === "number"
+            ) {
+              const rttMs = report.currentRoundTripTime * 1000;
+              if (!bestRtt || rttMs < bestRtt) {
+                bestRtt = rttMs;
+              }
+            }
+          });
+          if (bestRtt !== null) {
+            setRoundTripMs(Math.round(bestRtt));
+          }
+        } catch (err) {
+          console.warn("Failed to read connection stats", err);
+        }
+      }, 2000);
+
+      statsIntervalRef.current = intervalId;
+    },
+    [stopStatsMonitor],
+  );
 
   const resetSession = useCallback(() => {
     dataChannelRef.current?.close();
@@ -36,9 +164,12 @@ export function VoiceAgent() {
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
     }
+    stopStatsMonitor();
+    stopLevelMonitor();
+    setRoundTripMs(null);
     setTranscripts([]);
     setStatus("idle");
-  }, []);
+  }, [stopLevelMonitor, stopStatsMonitor]);
 
   useEffect(() => {
     return () => resetSession();
@@ -99,9 +230,16 @@ export function VoiceAgent() {
 
       peerConnection.ontrack = attachRemoteAudio;
       peerConnection.onconnectionstatechange = () => {
-        if (peerConnection.connectionState === "failed") {
+        const state = peerConnection.connectionState;
+        if (state === "connected") {
+          startStatsMonitor(peerConnection);
+        }
+        if (state === "failed") {
           setError("Connection failed");
           resetSession();
+        }
+        if (state === "disconnected" || state === "closed") {
+          stopStatsMonitor();
         }
       };
 
@@ -128,6 +266,7 @@ export function VoiceAgent() {
       localStream.getTracks().forEach((track) => {
         peerConnection.addTrack(track, localStream);
       });
+      void startLevelMonitor(localStream);
 
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
@@ -159,7 +298,15 @@ export function VoiceAgent() {
       setError(err instanceof Error ? err.message : "Unknown error");
       resetSession();
     }
-  }, [attachRemoteAudio, handleRealtimeEvent, resetSession, status]);
+  }, [
+    attachRemoteAudio,
+    handleRealtimeEvent,
+    resetSession,
+    startLevelMonitor,
+    startStatsMonitor,
+    status,
+    stopStatsMonitor,
+  ]);
 
   const stopSession = useCallback(() => {
     resetSession();
@@ -170,6 +317,9 @@ export function VoiceAgent() {
     if (status === "connecting") return "Connecting…";
     return "Idle";
   }, [status]);
+
+  const levelPercent = Math.round(Math.min(1, Math.max(0, inputLevel)) * 100);
+  const latencyLabel = roundTripMs !== null ? `${roundTripMs} ms` : "—";
 
   return (
     <div className="flex w-full max-w-3xl flex-col gap-6 rounded-2xl border border-zinc-200 bg-white/80 p-8 shadow-sm backdrop-blur md:p-10">
@@ -190,6 +340,25 @@ export function VoiceAgent() {
           {error ? (
             <p className="mt-2 text-sm text-red-600">Error: {error}</p>
           ) : null}
+          <div className="mt-4 flex flex-wrap items-center gap-6">
+            <div className="min-w-[180px]">
+              <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                Mic level
+              </p>
+              <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-200">
+                <div
+                  className="h-full rounded-full bg-emerald-500 transition-[width] duration-150 ease-out"
+                  style={{ width: `${levelPercent}%` }}
+                />
+              </div>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                Estimated RTT
+              </p>
+              <p className="mt-2 text-sm text-zinc-700">{latencyLabel}</p>
+            </div>
+          </div>
         </div>
         <div className="flex gap-3">
           <button
