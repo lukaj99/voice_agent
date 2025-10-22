@@ -18,12 +18,12 @@ Modern web experience that streams audio to and from OpenAI’s GPT‑4o Realtim
    cp .env.example .env
    # edit .env and set OPENAI_API_KEY
    ```
-   Optional: override `OPENAI_REALTIME_MODEL` if you want a specific preview version.
+   Optional: override `OPENAI_REALTIME_MODEL` (or `OPENAI_TRANSCRIPTION_MODEL` to change/disable live captions).
 3. Start the dev server:
    ```bash
    npm run dev
    ```
-4. Visit [http://localhost:3000](http://localhost:3000) and grant microphone permission. Click **Start** to negotiate a realtime session, **Stop** to end it.
+4. Visit [http://localhost:3000](http://localhost:3000) and grant microphone permission. Click **Start** to negotiate a realtime session, **Stop** to end it. Once connected, speak naturally or use the text composer to send a typed follow-up—both appear in the live conversation log together with assistant replies.
 
 ## Scripts
 - `npm run dev` – start Next.js in development mode.
