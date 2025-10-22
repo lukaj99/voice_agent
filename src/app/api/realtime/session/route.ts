@@ -13,7 +13,9 @@ export async function POST() {
     },
     body: JSON.stringify({
       model: env.OPENAI_REALTIME_MODEL,
-      voice: "verse",
+      // The voice is configurable via the OPENAI_REALTIME_VOICE environment variable for flexibility.
+      // Defaults to "verse" if not set.
+      voice: process.env.OPENAI_REALTIME_VOICE || "verse",
       modalities: ["text", "audio"],
     }),
   });
