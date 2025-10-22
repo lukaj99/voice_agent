@@ -285,10 +285,36 @@ export function VoiceAgent() {
       });
 
       try {
-        const args =
-          pending.argumentsBuffer && pending.argumentsBuffer.length > 0
-            ? JSON.parse(pending.argumentsBuffer)
-            : {};
+        let args = {};
+        if (pending.argumentsBuffer && pending.argumentsBuffer.length > 0) {
+          try {
+            args = JSON.parse(pending.argumentsBuffer);
+          } catch (parseErr) {
+            const errorMessage = "Malformed tool arguments: " + (parseErr instanceof Error ? parseErr.message : String(parseErr));
+            upsertMessage({
+              id: pending.messageId,
+              role: "tool",
+              content: `Tool ${pending.toolName} failed: ${errorMessage}`,
+              status: "complete",
+              toolName: pending.toolName,
+            });
+            sendClientEvent({
+              type: "conversation.item.create",
+              item: {
+                type: "function_call_output",
+                call_id: callId,
+                output: JSON.stringify({
+                  error: true,
+                  message: errorMessage,
+                }),
+              },
+            });
+            sendClientEvent({ type: "response.create" });
+            pending.status = "failed";
+            pendingToolCallsRef.current.delete(callId);
+            return;
+          }
+        }
 
         const response = await fetch("/api/tools/run", {
           method: "POST",
