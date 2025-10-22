@@ -9,6 +9,13 @@ type SessionResponse = {
 
 type TranscriptMap = Record<string, string>;
 
+type AgentMessage = {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  status: "streaming" | "complete";
+};
+
 const REALTIME_URL = "https://api.openai.com/v1/realtime";
 
 export function VoiceAgent() {
@@ -16,7 +23,8 @@ export function VoiceAgent() {
     "idle",
   );
   const [error, setError] = useState<string | null>(null);
-  const [transcripts, setTranscripts] = useState<string[]>([]);
+  const [messages, setMessages] = useState<AgentMessage[]>([]);
+  const [textInput, setTextInput] = useState("");
   const [inputLevel, setInputLevel] = useState(0);
   const [roundTripMs, setRoundTripMs] = useState<number | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -30,6 +38,39 @@ export function VoiceAgent() {
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const levelRafRef = useRef<number | null>(null);
   const statsIntervalRef = useRef<number | null>(null);
+
+  const upsertMessage = useCallback(
+    (update: {
+      id: string;
+      role?: AgentMessage["role"];
+      content?: string;
+      status?: AgentMessage["status"];
+    }) => {
+      setMessages((prev) => {
+        const index = prev.findIndex((msg) => msg.id === update.id);
+        if (index >= 0) {
+          const next = [...prev];
+          next[index] = {
+            ...next[index],
+            role: update.role ?? next[index].role,
+            content: update.content ?? next[index].content,
+            status: update.status ?? next[index].status,
+          };
+          return next;
+        }
+        return [
+          ...prev,
+          {
+            id: update.id,
+            role: update.role ?? "assistant",
+            content: update.content ?? "",
+            status: update.status ?? "streaming",
+          },
+        ];
+      });
+    },
+    [],
+  );
 
   const isActive = status === "connected";
 
@@ -167,7 +208,8 @@ export function VoiceAgent() {
     stopStatsMonitor();
     stopLevelMonitor();
     setRoundTripMs(null);
-    setTranscripts([]);
+    setMessages([]);
+    setTextInput("");
     setStatus("idle");
   }, [stopLevelMonitor, stopStatsMonitor]);
 
@@ -175,23 +217,65 @@ export function VoiceAgent() {
     return () => resetSession();
   }, [resetSession]);
 
-  const handleRealtimeEvent = useCallback((message: MessageEvent<string>) => {
-    try {
-      const payload = JSON.parse(message.data);
+  const handleRealtimeEvent = useCallback(
+    (message: MessageEvent<string>) => {
+      try {
+        const payload = JSON.parse(message.data) as Record<string, unknown>;
+        const type = payload.type;
 
-      if (payload.type === "response.output_text.delta") {
-        const responseId = payload.response_id as string;
-        const delta = payload.delta as string;
-        responseBufferRef.current[responseId] =
-          (responseBufferRef.current[responseId] ?? "") + delta;
-        setTranscripts(Object.values(responseBufferRef.current));
-      } else if (payload.type === "response.completed") {
-        setTranscripts(Object.values(responseBufferRef.current));
+        if (type === "response.output_text.delta") {
+          const responseId =
+            (payload.response_id as string | undefined) ??
+            (payload.response as { id?: string } | undefined)?.id;
+          const delta = payload.delta as string | undefined;
+          if (!responseId || !delta) return;
+
+          const nextText =
+            (responseBufferRef.current[responseId] ?? "") + delta;
+          responseBufferRef.current[responseId] = nextText;
+          upsertMessage({
+            id: responseId,
+            role: "assistant",
+            content: nextText,
+            status: "streaming",
+          });
+        } else if (type === "response.completed") {
+          const responseId =
+            (payload.response_id as string | undefined) ??
+            (payload.response as { id?: string } | undefined)?.id;
+          if (!responseId) return;
+          const finalText = responseBufferRef.current[responseId] ?? "";
+          upsertMessage({
+            id: responseId,
+            role: "assistant",
+            content: finalText,
+            status: "complete",
+          });
+        } else if (
+          type === "conversation.item.input_audio_transcription.completed"
+        ) {
+          const itemId = payload.item_id as string | undefined;
+          const transcript = payload.transcript as string | undefined;
+          if (itemId && transcript) {
+            upsertMessage({
+              id: itemId,
+              role: "user",
+              content: transcript,
+              status: "complete",
+            });
+          }
+        } else if (type === "response.error") {
+          const errorMessage =
+            (payload.error as { message?: string } | undefined)?.message ??
+            "Realtime response error";
+          setError(errorMessage);
+        }
+      } catch (e) {
+        console.warn("Unhandled realtime payload", e);
       }
-    } catch (e) {
-      console.warn("Unhandled realtime payload", e);
-    }
-  }, []);
+    },
+    [setError, upsertMessage],
+  );
 
   const attachRemoteAudio = useCallback((event: RTCTrackEvent) => {
     const [stream] = event.streams;
@@ -247,7 +331,12 @@ export function VoiceAgent() {
 
       const dataChannel = peerConnection.createDataChannel("oai-events");
       dataChannel.onmessage = handleRealtimeEvent;
-      dataChannel.onopen = () => setStatus("connected");
+      dataChannel.onopen = () => {
+        setStatus("connected");
+        setError(null);
+        setMessages([]);
+        responseBufferRef.current = {};
+      };
       dataChannel.onclose = () => {
         resetSession();
       };
@@ -304,6 +393,8 @@ export function VoiceAgent() {
     resetSession,
     startLevelMonitor,
     startStatsMonitor,
+    setError,
+    setMessages,
     status,
     stopStatsMonitor,
   ]);
@@ -311,6 +402,53 @@ export function VoiceAgent() {
   const stopSession = useCallback(() => {
     resetSession();
   }, [resetSession]);
+
+  const sendClientEvent = useCallback(
+    (event: Record<string, unknown>) => {
+      const channel = dataChannelRef.current;
+      if (!channel || channel.readyState !== "open") {
+        setError("Realtime channel is not ready yet.");
+        return;
+      }
+      channel.send(JSON.stringify(event));
+    },
+    [setError],
+  );
+
+  const sendTextMessage = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+
+      const itemId = `msg_${crypto.randomUUID()}`;
+
+      sendClientEvent({
+        type: "conversation.item.create",
+        item: {
+          id: itemId,
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: trimmed,
+            },
+          ],
+        },
+      });
+
+      sendClientEvent({ type: "response.create" });
+
+      upsertMessage({
+        id: itemId,
+        role: "user",
+        content: trimmed,
+        status: "complete",
+      });
+      setTextInput("");
+    },
+    [sendClientEvent, upsertMessage],
+  );
 
   const indicator = useMemo(() => {
     if (status === "connected") return "Connected";
@@ -320,6 +458,7 @@ export function VoiceAgent() {
 
   const levelPercent = Math.round(Math.min(1, Math.max(0, inputLevel)) * 100);
   const latencyLabel = roundTripMs !== null ? `${roundTripMs} ms` : "—";
+  const canSend = textInput.trim().length > 0 && status === "connected";
 
   return (
     <div className="flex w-full max-w-3xl flex-col gap-6 rounded-2xl border border-zinc-200 bg-white/80 p-8 shadow-sm backdrop-blur md:p-10">
@@ -328,8 +467,8 @@ export function VoiceAgent() {
           Voice Agent Playground
         </h1>
         <p className="text-sm text-zinc-600">
-          Stream audio to and from GPT-4o Realtime. Start to connect, stop to
-          end the session.
+          Stream audio to and from GPT-4o Realtime. Talk naturally or type a
+          follow-up once the session is connected.
         </p>
       </div>
 
@@ -381,18 +520,80 @@ export function VoiceAgent() {
       </div>
 
       <div className="flex flex-col gap-3">
-        <p className="text-sm font-medium text-zinc-800">Transcripts</p>
-        <div className="min-h-[120px] rounded-xl border border-dashed border-zinc-200 bg-zinc-50/80 p-4 text-sm text-zinc-700">
-          {transcripts.length > 0 ? (
-            transcripts.map((segment, index) => (
-              <p key={index} className="leading-relaxed">
-                {segment}
-              </p>
-            ))
+        <div className="flex items-center justify-between">
+          <p className="text-sm font-medium text-zinc-800">Conversation</p>
+          <span className="text-xs font-semibold uppercase tracking-wide text-zinc-400">
+            {messages.length} {messages.length === 1 ? "turn" : "turns"}
+          </span>
+        </div>
+        <div className="flex h-64 flex-col gap-4 overflow-y-auto rounded-xl border border-dashed border-zinc-200 bg-zinc-50/80 p-4">
+          {messages.length > 0 ? (
+            messages.map((message) => {
+              const isAssistant = message.role === "assistant";
+              const speakerLabel = isAssistant ? "Lumi" : "You";
+              return (
+                <div
+                  key={message.id}
+                  className={`flex ${isAssistant ? "justify-start" : "justify-end"}`}
+                >
+                  <div className="flex max-w-[80%] flex-col gap-1">
+                    <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                      {speakerLabel}
+                    </span>
+                    <div
+                      className={`rounded-2xl px-4 py-2 text-sm leading-relaxed shadow-sm ${
+                        isAssistant
+                          ? "bg-white text-zinc-800"
+                          : "bg-emerald-500 text-white"
+                      }`}
+                    >
+                      <p className="whitespace-pre-line">
+                        {message.content || "…"}
+                      </p>
+                      {message.status === "streaming" ? (
+                        <span className="mt-1 inline-block text-xs opacity-80">
+                          {isAssistant ? "thinking…" : "recording…"}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              );
+            })
           ) : (
-            <p className="text-zinc-500">No messages yet.</p>
+            <p className="text-sm text-zinc-500">
+              Say something or type a message once the session is connected.
+            </p>
           )}
         </div>
+        <form
+          className="flex items-center gap-3 rounded-xl border border-zinc-200 bg-white/90 p-3 shadow-sm"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (status !== "connected") return;
+            sendTextMessage(textInput);
+          }}
+        >
+          <input
+            type="text"
+            value={textInput}
+            onChange={(event) => setTextInput(event.target.value)}
+            placeholder={
+              status === "connected"
+                ? "Ask a follow-up with your keyboard…"
+                : "Connect first to send text"
+            }
+            disabled={status !== "connected"}
+            className="flex-1 bg-transparent text-sm text-zinc-800 outline-none placeholder:text-zinc-400 disabled:text-zinc-400"
+          />
+          <button
+            type="submit"
+            disabled={!canSend}
+            className="rounded-full bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-300"
+          >
+            Send
+          </button>
+        </form>
       </div>
 
       <audio ref={remoteAudioRef} autoPlay className="hidden" />
