@@ -32,6 +32,10 @@ Modern web experience that streams audio to and from OpenAI’s GPT‑4o Realtim
 
 Tool outputs stream back into the conversation automatically; you can extend the registry under `src/server/tools`.
 
+### Conversation Summaries
+- Hit **Summarize** once a chat has a few turns to generate a concise recap powered by `gpt-4o-mini` (`/api/conversations/summarize`).
+- Summaries highlight user intents, tool lookups, and follow-up actions.
+
 ## Scripts
 - `npm run dev` – start Next.js in development mode.
 - `npm run build` / `npm start` – production build and serve.
