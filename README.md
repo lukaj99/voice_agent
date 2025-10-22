@@ -7,6 +7,7 @@ Modern web experience that streams audio to and from OpenAI’s GPT‑4o Realtim
 - OpenAI Realtime API (duplex audio via WebRTC)
 - React client component managing microphone capture + remote playback
 - Zustand, LangChain, LangGraph, LangSmith scaffolding (dependencies in place for upcoming agent orchestration work)
+- Server-executed tools exposed to GPT‑4o (weather + current time) with automatic function-call handling
 
 ## Local Setup
 1. Install dependencies:
@@ -24,6 +25,12 @@ Modern web experience that streams audio to and from OpenAI’s GPT‑4o Realtim
    npm run dev
    ```
 4. Visit [http://localhost:3000](http://localhost:3000) and grant microphone permission. Click **Start** to negotiate a realtime session, **Stop** to end it. Once connected, speak naturally or use the text composer to send a typed follow-up—both appear in the live conversation log together with assistant replies.
+
+### Built-in Tools
+- `get_weather_forecast` – hits the public [wttr.in](https://wttr.in) endpoint (no key required) to summarize current conditions plus a short forecast for the requested city.
+- `get_current_time` – returns the server's current ISO timestamp.
+
+Tool outputs stream back into the conversation automatically; you can extend the registry under `src/server/tools`.
 
 ## Scripts
 - `npm run dev` – start Next.js in development mode.

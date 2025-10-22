@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { DEFAULT_AGENT_INSTRUCTIONS } from "@/config/agent";
+import { TOOL_DEFINITIONS } from "@/config/tools";
 import { env } from "@/lib/env";
 
 const OPENAI_REALTIME_URL = "https://api.openai.com/v1/realtime/sessions";
@@ -14,6 +15,8 @@ export async function POST() {
     voice: "verse",
     modalities: ["text", "audio"],
     instructions: DEFAULT_AGENT_INSTRUCTIONS.trim(),
+    tools: TOOL_DEFINITIONS,
+    tool_choice: "auto",
   };
 
   if (transcriptionModel) {
