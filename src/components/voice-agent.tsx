@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import type { ToolName } from "@/config/tools";
+
 type SessionResponse = {
   client_secret: { value: string };
   model: string;
@@ -11,12 +13,22 @@ type TranscriptMap = Record<string, string>;
 
 type AgentMessage = {
   id: string;
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "tool";
   content: string;
   status: "streaming" | "complete";
+  toolName?: ToolName;
 };
 
 const REALTIME_URL = "https://api.openai.com/v1/realtime";
+
+type PendingToolCall = {
+  toolName: ToolName;
+  responseId: string;
+  itemId: string;
+  argumentsBuffer: string;
+  messageId: string;
+  status: "collecting" | "executing" | "completed" | "failed";
+};
 
 export function VoiceAgent() {
   const [status, setStatus] = useState<"idle" | "connecting" | "connected">(
@@ -38,6 +50,9 @@ export function VoiceAgent() {
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const levelRafRef = useRef<number | null>(null);
   const statsIntervalRef = useRef<number | null>(null);
+  const pendingToolCallsRef = useRef<Map<string, PendingToolCall>>(
+    new Map(),
+  );
 
   const upsertMessage = useCallback(
     (update: {
@@ -45,6 +60,7 @@ export function VoiceAgent() {
       role?: AgentMessage["role"];
       content?: string;
       status?: AgentMessage["status"];
+      toolName?: ToolName;
     }) => {
       setMessages((prev) => {
         const index = prev.findIndex((msg) => msg.id === update.id);
@@ -55,6 +71,7 @@ export function VoiceAgent() {
             role: update.role ?? next[index].role,
             content: update.content ?? next[index].content,
             status: update.status ?? next[index].status,
+            toolName: update.toolName ?? next[index].toolName,
           };
           return next;
         }
@@ -65,6 +82,7 @@ export function VoiceAgent() {
             role: update.role ?? "assistant",
             content: update.content ?? "",
             status: update.status ?? "streaming",
+            toolName: update.toolName,
           },
         ];
       });
@@ -202,6 +220,7 @@ export function VoiceAgent() {
     }
     stopStatsMonitor();
     stopLevelMonitor();
+    pendingToolCallsRef.current.clear();
     setRoundTripMs(null);
     setMessages([]);
     setTextInput("");
@@ -211,6 +230,204 @@ export function VoiceAgent() {
   useEffect(() => {
     return () => resetSession();
   }, [resetSession]);
+
+  const attachRemoteAudio = useCallback((event: RTCTrackEvent) => {
+    const [stream] = event.streams;
+    if (!stream) return;
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = stream;
+      const promise = remoteAudioRef.current.play();
+      if (promise) {
+        promise.catch((err) => {
+          console.warn("Autoplay failed", err);
+        });
+      }
+    }
+  }, []);
+
+  const stopSession = useCallback(() => {
+    resetSession();
+  }, [resetSession]);
+
+  const sendClientEvent = useCallback(
+    (event: Record<string, unknown>) => {
+      const channel = dataChannelRef.current;
+      if (!channel || channel.readyState !== "open") {
+        setError("Realtime channel is not ready yet.");
+        return;
+      }
+      channel.send(JSON.stringify(event));
+    },
+    [setError],
+  );
+
+  const executeToolCall = useCallback(
+    async (callId: string) => {
+      const pending = pendingToolCallsRef.current.get(callId);
+      if (!pending || pending.status === "executing") {
+        return;
+      }
+
+      pending.status = "executing";
+      pendingToolCallsRef.current.set(callId, pending);
+
+      upsertMessage({
+        id: pending.messageId,
+        role: "tool",
+        content: `Running ${pending.toolName}…`,
+        status: "streaming",
+        toolName: pending.toolName,
+      });
+
+      try {
+        let args = {};
+        if (pending.argumentsBuffer && pending.argumentsBuffer.length > 0) {
+          try {
+            args = JSON.parse(pending.argumentsBuffer);
+          } catch (parseErr) {
+            const errorMessage = "Malformed tool arguments: " + (parseErr instanceof Error ? parseErr.message : String(parseErr));
+            upsertMessage({
+              id: pending.messageId,
+              role: "tool",
+              content: `Tool ${pending.toolName} failed: ${errorMessage}`,
+              status: "complete",
+              toolName: pending.toolName,
+            });
+            sendClientEvent({
+              type: "conversation.item.create",
+              item: {
+                type: "function_call_output",
+                call_id: callId,
+                output: JSON.stringify({
+                  error: true,
+                  message: errorMessage,
+                }),
+              },
+            });
+            sendClientEvent({ type: "response.create" });
+            pending.status = "failed";
+            pendingToolCallsRef.current.delete(callId);
+            return;
+          }
+        }
+
+        const response = await fetch("/api/tools/run", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            toolName: pending.toolName,
+            arguments: args,
+          }),
+        });
+
+        const json = (await response.json()) as {
+          success?: boolean;
+          result?: { content?: string; data?: Record<string, unknown> };
+          error?: string;
+        };
+
+        if (!response.ok || !json.success || !json.result) {
+          throw new Error(
+            json.error ??
+              `Tool ${pending.toolName} failed with status ${response.status}`,
+          );
+        }
+
+        const toolContent =
+          json.result.content ??
+          `Tool ${pending.toolName} executed successfully.`;
+
+        upsertMessage({
+          id: pending.messageId,
+          role: "tool",
+          content: toolContent,
+          status: "complete",
+          toolName: pending.toolName,
+        });
+
+        const outputPayload = {
+          content: toolContent,
+          data: json.result.data ?? {},
+        };
+
+        sendClientEvent({
+          type: "conversation.item.create",
+          item: {
+            type: "function_call_output",
+            call_id: callId,
+            output: JSON.stringify(outputPayload),
+          },
+        });
+
+        sendClientEvent({ type: "response.create" });
+        pending.status = "completed";
+      } catch (err) {
+        const errorMessage =
+          err instanceof Error ? err.message : "Unknown tool error";
+        upsertMessage({
+          id: pending.messageId,
+          role: "tool",
+          content: `Tool ${pending.toolName} failed: ${errorMessage}`,
+          status: "complete",
+          toolName: pending.toolName,
+        });
+
+        sendClientEvent({
+          type: "conversation.item.create",
+          item: {
+            type: "function_call_output",
+            call_id: callId,
+            output: JSON.stringify({
+              error: true,
+              message: errorMessage,
+            }),
+          },
+        });
+        sendClientEvent({ type: "response.create" });
+        pending.status = "failed";
+      } finally {
+        pendingToolCallsRef.current.delete(callId);
+      }
+    },
+    [sendClientEvent, upsertMessage],
+  );
+
+  const sendTextMessage = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+
+      const itemId = `msg_${crypto.randomUUID()}`;
+
+      sendClientEvent({
+        type: "conversation.item.create",
+        item: {
+          id: itemId,
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: trimmed,
+            },
+          ],
+        },
+      });
+
+      sendClientEvent({ type: "response.create" });
+
+      upsertMessage({
+        id: itemId,
+        role: "user",
+        content: trimmed,
+        status: "complete",
+      });
+      setTextInput("");
+    },
+    [sendClientEvent, upsertMessage],
+  );
 
   const handleRealtimeEvent = useCallback(
     (message: MessageEvent<string>) => {
@@ -259,6 +476,60 @@ export function VoiceAgent() {
               status: "complete",
             });
           }
+        } else if (type === "response.output_item.added") {
+          const item = payload.item as
+            | {
+                type?: string;
+                call_id?: string;
+                name?: string;
+                id?: string;
+              }
+            | undefined;
+          const responseId = payload.response_id as string | undefined;
+
+          if (
+            item?.type === "function_call" &&
+            item.call_id &&
+            item.name &&
+            responseId
+          ) {
+            const messageId = `tool_${item.call_id}`;
+            pendingToolCallsRef.current.set(item.call_id, {
+              toolName: item.name as ToolName,
+              responseId,
+              itemId: item.id ?? item.call_id,
+              argumentsBuffer: "",
+              messageId,
+              status: "collecting",
+            });
+
+            upsertMessage({
+              id: messageId,
+              role: "tool",
+              content: `Calling ${item.name}…`,
+              status: "streaming",
+              toolName: item.name as ToolName,
+            });
+          }
+        } else if (type === "response.function_call_arguments.delta") {
+          const callId = payload.call_id as string | undefined;
+          const delta = payload.delta as string | undefined;
+          if (!callId || !delta) return;
+          const pending = pendingToolCallsRef.current.get(callId);
+          if (pending) {
+            pending.argumentsBuffer += delta;
+            pendingToolCallsRef.current.set(callId, pending);
+          }
+        } else if (type === "response.function_call_arguments.done") {
+          const callId = payload.call_id as string | undefined;
+          const args = payload.arguments as string | undefined;
+          if (!callId) return;
+          const pending = pendingToolCallsRef.current.get(callId);
+          if (pending) {
+            pending.argumentsBuffer = args ?? pending.argumentsBuffer;
+            pendingToolCallsRef.current.set(callId, pending);
+            void executeToolCall(callId);
+          }
         } else if (type === "response.error") {
           const errorMessage =
             (payload.error as { message?: string } | undefined)?.message ??
@@ -269,22 +540,8 @@ export function VoiceAgent() {
         console.warn("Unhandled realtime payload", e);
       }
     },
-    [setError, upsertMessage],
+    [executeToolCall, setError, upsertMessage],
   );
-
-  const attachRemoteAudio = useCallback((event: RTCTrackEvent) => {
-    const [stream] = event.streams;
-    if (!stream) return;
-    if (remoteAudioRef.current) {
-      remoteAudioRef.current.srcObject = stream;
-      const promise = remoteAudioRef.current.play();
-      if (promise) {
-        promise.catch((err) => {
-          console.warn("Autoplay failed", err);
-        });
-      }
-    }
-  }, []);
 
   const startSession = useCallback(async () => {
     if (status !== "idle") {
@@ -331,6 +588,7 @@ export function VoiceAgent() {
         setError(null);
         setMessages([]);
         responseBufferRef.current = {};
+        pendingToolCallsRef.current.clear();
       };
       dataChannel.onclose = () => {
         resetSession();
@@ -393,57 +651,6 @@ export function VoiceAgent() {
     status,
     stopStatsMonitor,
   ]);
-
-  const stopSession = useCallback(() => {
-    resetSession();
-  }, [resetSession]);
-
-  const sendClientEvent = useCallback(
-    (event: Record<string, unknown>) => {
-      const channel = dataChannelRef.current;
-      if (!channel || channel.readyState !== "open") {
-        setError("Realtime channel is not ready yet.");
-        return;
-      }
-      channel.send(JSON.stringify(event));
-    },
-    [setError],
-  );
-
-  const sendTextMessage = useCallback(
-    (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed) return;
-
-      const itemId = `msg_${crypto.randomUUID()}`;
-
-      sendClientEvent({
-        type: "conversation.item.create",
-        item: {
-          id: itemId,
-          type: "message",
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: trimmed,
-            },
-          ],
-        },
-      });
-
-      sendClientEvent({ type: "response.create" });
-
-      upsertMessage({
-        id: itemId,
-        role: "user",
-        content: trimmed,
-        status: "complete",
-      });
-      setTextInput("");
-    },
-    [sendClientEvent, upsertMessage],
-  );
 
   const indicator = useMemo(() => {
     if (status === "connected") return "Connected";
@@ -525,29 +732,40 @@ export function VoiceAgent() {
           {messages.length > 0 ? (
             messages.map((message) => {
               const isAssistant = message.role === "assistant";
-              const speakerLabel = isAssistant ? "Lumi" : "You";
+              const isUser = message.role === "user";
+              const isTool = message.role === "tool";
+              const speakerLabel = isTool
+                ? `Tool • ${message.toolName ?? "function"}`
+                : isAssistant
+                  ? "Lumi"
+                  : "You";
+              const alignmentClass = isUser ? "justify-end" : "justify-start";
+              const bubbleClass = isUser
+                ? "bg-emerald-500 text-white"
+                : isTool
+                  ? "bg-zinc-200 text-zinc-800 border border-zinc-300"
+                  : "bg-white text-zinc-800";
+              const statusLabel = isTool
+                ? (message.status === "streaming" ? "executing…" : "")
+                : isAssistant
+                  ? "thinking…"
+                  : "recording…";
+
               return (
-                <div
-                  key={message.id}
-                  className={`flex ${isAssistant ? "justify-start" : "justify-end"}`}
-                >
+                <div key={message.id} className={`flex ${alignmentClass}`}>
                   <div className="flex max-w-[80%] flex-col gap-1">
                     <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
                       {speakerLabel}
                     </span>
                     <div
-                      className={`rounded-2xl px-4 py-2 text-sm leading-relaxed shadow-sm ${
-                        isAssistant
-                          ? "bg-white text-zinc-800"
-                          : "bg-emerald-500 text-white"
-                      }`}
+                      className={`rounded-2xl px-4 py-2 text-sm leading-relaxed shadow-sm ${bubbleClass}`}
                     >
                       <p className="whitespace-pre-line">
                         {message.content || "…"}
                       </p>
                       {message.status === "streaming" ? (
                         <span className="mt-1 inline-block text-xs opacity-80">
-                          {isAssistant ? "thinking…" : "recording…"}
+                          {statusLabel}
                         </span>
                       ) : null}
                     </div>
