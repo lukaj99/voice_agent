@@ -39,6 +39,9 @@ export function VoiceAgent() {
   const [textInput, setTextInput] = useState("");
   const [inputLevel, setInputLevel] = useState(0);
   const [roundTripMs, setRoundTripMs] = useState<number | null>(null);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [isSummarizing, setIsSummarizing] = useState(false);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -227,7 +230,6 @@ export function VoiceAgent() {
     stopLevelMonitor();
     pendingToolCallsRef.current.clear();
     setRoundTripMs(null);
-    setMessages([]);
     setTextInput("");
     setStatus("idle");
   }, [stopLevelMonitor, stopStatsMonitor]);
@@ -568,6 +570,9 @@ export function VoiceAgent() {
         setMessages([]);
         responseBufferRef.current = {};
         pendingToolCallsRef.current.clear();
+        setSummary(null);
+        setSummaryError(null);
+        setIsSummarizing(false);
       };
       dataChannel.onclose = () => {
         resetSession();
@@ -640,6 +645,60 @@ export function VoiceAgent() {
   const levelPercent = Math.round(Math.min(1, Math.max(0, inputLevel)) * 100);
   const latencyLabel = roundTripMs !== null ? `${roundTripMs} ms` : "—";
   const canSend = textInput.trim().length > 0 && status === "connected";
+  const hasTranscript = useMemo(
+    () =>
+      messages.some(
+        (message) =>
+          (message.role === "user" || message.role === "assistant") &&
+          message.content.trim().length > 0,
+      ),
+    [messages],
+  );
+
+  const summarizeConversation = useCallback(async () => {
+    if (!hasTranscript || isSummarizing) {
+      return;
+    }
+
+    setIsSummarizing(true);
+    setSummaryError(null);
+    setSummary(null);
+
+    try {
+      const payloadMessages = messages
+        .filter((message) => message.content.trim().length > 0)
+        .map((message) => ({
+          role: message.role,
+          content: message.content,
+        }));
+
+      const response = await fetch("/api/conversations/summarize", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ messages: payloadMessages }),
+      });
+
+      const json = (await response.json()) as {
+        success?: boolean;
+        summary?: string;
+        error?: string;
+      };
+
+      if (!response.ok || !json.success || !json.summary) {
+        throw new Error(json.error ?? "Failed to summarize conversation");
+      }
+
+      setSummary(json.summary);
+    } catch (err) {
+      setSummaryError(
+        err instanceof Error ? err.message : "Unknown summarization error",
+      );
+    } finally {
+      setIsSummarizing(false);
+    }
+  }, [hasTranscript, isSummarizing, messages]);
 
   return (
     <div className="flex w-full max-w-3xl flex-col gap-6 rounded-2xl border border-zinc-200 bg-white/80 p-8 shadow-sm backdrop-blur md:p-10">
@@ -752,11 +811,11 @@ export function VoiceAgent() {
                 </div>
               );
             })
-          ) : (
-            <p className="text-sm text-zinc-500">
-              Say something or type a message once the session is connected.
-            </p>
-          )}
+            ) : (
+              <p className="text-sm text-zinc-500">
+                Say something or type a message once the session is connected.
+              </p>
+            )}
         </div>
         <form
           className="flex items-center gap-3 rounded-xl border border-zinc-200 bg-white/90 p-3 shadow-sm"
@@ -786,6 +845,35 @@ export function VoiceAgent() {
             Send
           </button>
         </form>
+      </div>
+
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <p className="text-sm font-medium text-zinc-800">Summary</p>
+          <button
+            type="button"
+            onClick={summarizeConversation}
+            disabled={!hasTranscript || isSummarizing}
+            className="rounded-full border border-zinc-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-zinc-700 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:text-zinc-400"
+          >
+            {isSummarizing ? "Summarizing…" : "Summarize"}
+          </button>
+        </div>
+        <div className="min-h-[100px] rounded-xl border border-dashed border-zinc-200 bg-zinc-50/80 p-4 text-sm text-zinc-700">
+          {isSummarizing ? (
+            <p className="text-zinc-500">Generating concise recap…</p>
+          ) : summary ? (
+            <p className="whitespace-pre-line">{summary}</p>
+          ) : (
+            <p className="text-zinc-500">
+              Run a summary to capture highlights once the conversation has a few
+              turns. Tool call results are included automatically.
+            </p>
+          )}
+        </div>
+        {summaryError ? (
+          <p className="text-xs text-red-600">{summaryError}</p>
+        ) : null}
       </div>
 
       <audio ref={remoteAudioRef} autoPlay className="hidden" />
