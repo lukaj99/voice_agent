@@ -751,7 +751,7 @@ export function VoiceAgent() {
                   ? "bg-zinc-200 text-zinc-800 border border-zinc-300"
                   : "bg-white text-zinc-800";
               const statusLabel = isTool
-                ? "executing…"
+                ? (message.status === "streaming" ? "executing…" : "")
                 : isAssistant
                   ? "thinking…"
                   : "recording…";
