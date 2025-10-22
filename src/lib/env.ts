@@ -22,7 +22,11 @@ const parsed = envSchema.safeParse({
 
 if (!parsed.success) {
   throw new Error(
-    `Invalid environment variables: ${parsed.error.flatten().fieldErrors.OPENAI_API_KEY?.join(", ")}`
+    `Invalid environment variables: ${
+      Object.entries(parsed.error.flatten().fieldErrors)
+        .map(([k, v]) => `${k}: ${v?.join(", ")}`)
+        .join("; ")
+    }`
   );
 }
 
