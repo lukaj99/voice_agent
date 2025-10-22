@@ -26,7 +26,13 @@ export async function POST() {
       Authorization: `Bearer ${env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(requestBody),
+    body: JSON.stringify({
+      model: env.OPENAI_REALTIME_MODEL,
+      // The voice is configurable via the OPENAI_REALTIME_VOICE environment variable for flexibility.
+      // Defaults to "verse" if not set.
+      voice: process.env.OPENAI_REALTIME_VOICE || "verse",
+      modalities: ["text", "audio"],
+    }),
   });
 
   if (!response.ok) {
