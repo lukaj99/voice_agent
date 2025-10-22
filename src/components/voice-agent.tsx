@@ -116,17 +116,12 @@ export function VoiceAgent() {
           await audioContextRef.current.resume();
         }
 
-        const source =
-          sourceNodeRef.current ??
-          audioContextRef.current.createMediaStreamSource(stream);
-        const analyser =
-          analyserRef.current ?? audioContextRef.current.createAnalyser();
+        const source = audioContextRef.current.createMediaStreamSource(stream);
+        const analyser = audioContextRef.current.createAnalyser();
         analyser.fftSize = 512;
         source.connect(analyser);
 
-        const data =
-          analyserDataRef.current ??
-          new Float32Array(analyser.fftSize);
+        const data = new Float32Array(analyser.fftSize);
 
         sourceNodeRef.current = source;
         analyserRef.current = analyser;
